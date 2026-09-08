@@ -7,11 +7,11 @@
 // completion/hover/definition seam. The constellation's architecture
 // at the language level: one door, many lanes.
 
-use vaked_lsp::frame::{encode_frame, jsonrpc_request, read_frame};
+use vaked_lsp::frame::{content_length, encode_frame_bytes, header_end, jsonrpc_notify, jsonrpc_request};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result;
@@ -41,11 +41,12 @@ fn route_for(uri: &str) -> Option<(&'static str, &'static str)> {
 struct SubServer {
     child: Option<Child>,
     next_id: u64,
+    read_buf: Vec<u8>, // framed-read carry for the sub-server stdout
 }
 
 struct RouterState {
     client: Client,
-    sub: Arc<Mutex<HashMap<String, SubServer>>>,
+    sub: Arc<Mutex<HashMap<&'static str, SubServer>>>,
 }
 
 impl RouterState {
@@ -53,9 +54,8 @@ impl RouterState {
     /// JSON-RPC message to it and return the response body.
     async fn forward(&self, uri: &str, method: &str, params: &serde_json::Value) -> Option<serde_json::Value> {
         let (cmd, lane) = route_for(uri)?;
-        let key = lane.to_string();
         let mut subs = self.sub.lock().await;
-        let entry = subs.entry(key.clone()).or_default();
+        let entry = subs.entry(lane).or_default();
         if entry.child.is_none() {
             match Command::new(cmd)
                 .stdin(Stdio::piped())
@@ -81,41 +81,88 @@ impl RouterState {
         entry.next_id += 1;
         let id = entry.next_id;
         let req = jsonrpc_request(id, method, params);
+        let req_bytes = serde_json::to_vec(&req).unwrap_or_default();
         // initialize handshake on first forward — the sub-server needs it
         if id == 1 {
-            let init = jsonrpc_request(
-                0,
-                "initialize",
-                &serde_json::json!({
-                    "processId": null,
-                    "rootUri": null,
-                    "capabilities": {}
-                }),
-            );
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(&encode_frame(&init.to_string())).await;
-                let _ = stdin.write_all(b"\0").await; // no-op separator guard
-            }
-            if let Some(stdout) = child.stdout.as_mut() {
-                let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
-                let _ = reader.read_line(&mut line).await; // swallow the handshake frame
-            }
-            let inited = jsonrpc_request(0, "initialized", &serde_json::json!({}));
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(&encode_frame(&inited.to_string())).await;
-            }
+            handshake(child, &mut entry.read_buf).await;
         }
         if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(&encode_frame(&req.to_string())).await;
+            let _ = stdin.write_all(&encode_frame_bytes(&req_bytes)).await;
+            let _ = stdin.flush().await;
         }
+        // read frames until the response carrying our id — notifications
+        // ($/progress) and any other ids are skipped, the pipe never desyncs
         if let Some(stdout) = child.stdout.as_mut() {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            let _ = reader.read_line(&mut line).await;
-            return serde_json::from_str(line.trim()).ok();
+            for _ in 0..32 {
+                let msg = read_sub_frame(stdout, &mut entry.read_buf).await?;
+                if msg.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                    return Some(msg);
+                }
+            }
         }
         None
+    }
+}
+
+/// The LSP initialize handshake on the sub-server: full framed reads (no
+/// line-swallowing), and `initialized` as a true notification (no id).
+async fn handshake(child: &mut Child, read_buf: &mut Vec<u8>) {
+    let init = jsonrpc_request(
+        0,
+        "initialize",
+        &serde_json::json!({
+            "processId": null,
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+    if let Some(stdin) = child.stdin.as_mut() {
+        if let Ok(bytes) = serde_json::to_vec(&init) {
+            let _ = stdin.write_all(&encode_frame_bytes(&bytes)).await;
+            let _ = stdin.flush().await;
+        }
+    }
+    if let Some(stdout) = child.stdout.as_mut() {
+        let _ = read_sub_frame(stdout, read_buf).await; // the initialize response
+    }
+    let inited = jsonrpc_notify("initialized", &serde_json::json!({}));
+    if let Some(stdin) = child.stdin.as_mut() {
+        if let Ok(bytes) = serde_json::to_vec(&inited) {
+            let _ = stdin.write_all(&encode_frame_bytes(&bytes)).await;
+            let _ = stdin.flush().await;
+        }
+    }
+}
+
+/// Read one full framed JSON-RPC message from a sub-server's stdout,
+/// appending to the per-lane carry buffer — no per-byte syscalls, no
+/// String header parsing. The gateway's response path stays cheap.
+async fn read_sub_frame(
+    stdout: &mut tokio::process::ChildStdout,
+    buf: &mut Vec<u8>,
+) -> Option<serde_json::Value> {
+    loop {
+        if let Some(pos) = header_end(buf) {
+            let len = content_length(&buf[..pos])?;
+            let body_start = pos + 4;
+            while buf.len() < body_start + len {
+                let n = stdout.read_buf(buf).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+            }
+            let v: Option<serde_json::Value> =
+                serde_json::from_slice(&buf[body_start..body_start + len]).ok();
+            buf.drain(..body_start + len);
+            return v;
+        }
+        if buf.len() > 65536 {
+            return None;
+        }
+        let n = stdout.read_buf(buf).await.ok()?;
+        if n == 0 {
+            return None;
+        }
     }
 }
 

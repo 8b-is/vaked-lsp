@@ -14,7 +14,7 @@
 
 use std::io::{Read, Write};
 use std::process::Command;
-use vaked_lsp::frame::{encode_frame, read_frame};
+use vaked_lsp::frame::{encode_frame_bytes, FrameReader};
 
 // ── configuration (env or defaults) ────────────────────────────────────────
 fn env(key: &str, default: &str) -> String {
@@ -218,6 +218,70 @@ fn tool_mlx(cfg: &Config, action: &str, args: &serde_json::Value) -> serde_json:
     }
 }
 
+// mlx_vision — ask the local vision lane (Qwen2.5-VL 3B, MLX) about an
+// image: render QA, art direction checks, the eye on the export lane.
+fn tool_mlx_vision(cfg: &Config, args: &serde_json::Value) -> serde_json::Value {
+    let mut cmd = Command::new("uv");
+    cmd.arg("run").arg("--project").arg(&cfg.mlx_sidecar_dir)
+        .arg("python").arg(format!("{}/sidecar.py", cfg.mlx_sidecar_dir)).arg("vision");
+    let image = args.get("image").and_then(|v| v.as_str()).unwrap_or("");
+    let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+    if image.is_empty() || prompt.is_empty() {
+        return lane("mlx.vision", false, "image path + prompt required".into());
+    }
+    cmd.arg(image).arg(prompt);
+    if let Some(v) = args.get("max_tokens").and_then(|v| v.as_u64()) {
+        cmd.arg("--max-tokens").arg(v.to_string());
+    }
+    match cmd.output() {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let detail = if !out.is_empty() { out } else { err };
+            lane("mlx.vision", o.status.success(),
+                format!("exit {} · {}", o.status.code().unwrap_or(-1), detail))
+        }
+        Err(e) => lane("mlx.vision", false, format!("spawn failed: {e}")),
+    }
+}
+
+// mlx_image — FLUX.1-schnell concept art, one-shot on the local diffuser.
+fn tool_mlx_image(cfg: &Config, args: &serde_json::Value) -> serde_json::Value {
+    let mut cmd = Command::new("uv");
+    cmd.arg("run").arg("--project").arg(&cfg.mlx_sidecar_dir)
+        .arg("python").arg(format!("{}/sidecar.py", cfg.mlx_sidecar_dir)).arg("image");
+    let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+    if prompt.is_empty() {
+        return lane("mlx.image", false, "prompt required".into());
+    }
+    cmd.arg(prompt);
+    if let Some(v) = args.get("steps").and_then(|v| v.as_u64()) {
+        cmd.arg("--steps").arg(v.to_string());
+    }
+    if let Some(v) = args.get("width").and_then(|v| v.as_u64()) {
+        cmd.arg("--width").arg(v.to_string());
+    }
+    if let Some(v) = args.get("height").and_then(|v| v.as_u64()) {
+        cmd.arg("--height").arg(v.to_string());
+    }
+    if let Some(v) = args.get("seed").and_then(|v| v.as_u64()) {
+        cmd.arg("--seed").arg(v.to_string());
+    }
+    if let Some(v) = args.get("out").and_then(|v| v.as_str()) {
+        if !v.is_empty() { cmd.arg("--out").arg(v); }
+    }
+    match cmd.output() {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let detail = if !out.is_empty() { out } else { err };
+            lane("mlx.image", o.status.success(),
+                format!("exit {} · {}", o.status.code().unwrap_or(-1), detail))
+        }
+        Err(e) => lane("mlx.image", false, format!("spawn failed: {e}")),
+    }
+}
+
 // fab_search — the asset marketplace lane: returns the browse/search URL.
 fn tool_fab_search(cfg: &Config, query: &str) -> serde_json::Value {
     let url = format!("{}?keywords={}", cfg.fab_base, query.replace(' ', "%20"));
@@ -270,6 +334,8 @@ fn tools_list() -> Vec<serde_json::Value> {
         serde_json::json!({"name":"mlx_models","description":"the fast top-SWE-score coder catalog (local MLX)","inputSchema":{"type":"object","properties":{}}}),
         serde_json::json!({"name":"mlx_start","description":"start a local MLX coder lane (omit model to auto-select by free memory)","inputSchema":{"type":"object","properties":{"model":{"type":"string"},"quantized":{"type":"boolean"},"force":{"type":"boolean"}}}}),
         serde_json::json!({"name":"mlx_stop","description":"stop a local MLX coder lane","inputSchema":{"type":"object","properties":{"model":{"type":"string"}},"required":["model"]}}),
+        serde_json::json!({"name":"mlx_vision","description":"ask the local vision lane (Qwen2.5-VL 3B on MLX) about an image — render/art QA","inputSchema":{"type":"object","properties":{"image":{"type":"string"},"prompt":{"type":"string"},"max_tokens":{"type":"integer"}},"required":["image","prompt"]}}),
+        serde_json::json!({"name":"mlx_image","description":"generate concept art with FLUX.1-schnell on the local diffuser (one-shot)","inputSchema":{"type":"object","properties":{"prompt":{"type":"string"},"steps":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"seed":{"type":"integer"},"out":{"type":"string"}},"required":["prompt"]}}),
         serde_json::json!({"name":"sandbox_status","description":"probe the sandbox backends (Apple Containers / bwrap / podman)","inputSchema":{"type":"object","properties":{}}}),
         serde_json::json!({"name":"sandbox_doctor","description":"check all sandbox backends are available","inputSchema":{"type":"object","properties":{}}}),
         serde_json::json!({"name":"sandbox_run","description":"run a command in a sandboxed container","inputSchema":{"type":"object","properties":{"image":{"type":"string"}},"required":["image"]}}),
@@ -308,6 +374,8 @@ fn dispatch(cfg: &Config, name: &str, args: &serde_json::Value) -> serde_json::V
         "mlx_models" => tool_mlx(cfg, "models", args),
         "mlx_start" => tool_mlx(cfg, "start", args),
         "mlx_stop" => tool_mlx(cfg, "stop", args),
+        "mlx_vision" => tool_mlx_vision(cfg, args),
+        "mlx_image" => tool_mlx_image(cfg, args),
         "sandbox_status" => tool_sandbox(cfg, "status", args),
         "sandbox_doctor" => tool_sandbox(cfg, "doctor", args),
         "sandbox_run" => tool_sandbox(cfg, "run", args),
@@ -323,13 +391,13 @@ fn dispatch(cfg: &Config, name: &str, args: &serde_json::Value) -> serde_json::V
 // ── the MCP loop ───────────────────────────────────────────────────────────
 fn main() {
     let cfg = Config::from_env();
-    let mut stdin = std::io::stdin().lock();
+    let mut reader = FrameReader::new(std::io::stdin().lock());
     let mut stdout = std::io::stdout().lock();
     let mut initialized = false;
     let mut running = true;
 
     while running {
-        let frame = match read_frame(&mut stdin) {
+        let frame = match reader.read_frame() {
             Ok(f) => f,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -349,33 +417,58 @@ fn main() {
 
         // notifications carry no id — respond only to requests
         if id.is_some() {
-            let result = match method {
+            let (result, err): (Option<serde_json::Value>, Option<serde_json::Value>) = match method {
                 "initialize" => {
                     initialized = true;
-                    serde_json::json!({
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": { "tools": {} },
-                        "serverInfo": { "name": "vaked-mcp", "version": env!("CARGO_PKG_VERSION") }
-                    })
+                    (
+                        Some(serde_json::json!({
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": { "tools": { "listChanged": false } },
+                            "serverInfo": {
+                                "name": "vaked-mcp",
+                                "title": "vaked-mcp · the engine umbrella",
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "description": "one MCP endpoint in front of the engines — Unreal, Unity, FAB, Unity Cloud, the MLX sidecar, and the sandbox"
+                            },
+                            "instructions": "umbrella_status maps the warm lanes; ue_* and unity_* drive the editors; mlx_* supervise the local coder lanes; sandbox_* run the dev sandbox — a cold lane returns a key, never a dead end"
+                        })),
+                        None,
+                    )
                 }
-                "tools/list" => serde_json::json!({ "tools": tools_list() }),
+                "tools/list" => (Some(serde_json::json!({ "tools": tools_list() })), None),
                 "tools/call" => {
                     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     let args = params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
-                    let out = dispatch(&cfg, name, &args).to_string();
-                    serde_json::json!({ "content": [ { "type": "text", "text": out } ] })
+                    let out = dispatch(&cfg, name, &args);
+                    let is_err = out.get("ok").and_then(|v| v.as_bool()) == Some(false);
+                    (
+                        Some(serde_json::json!({
+                            "content": [ { "type": "text", "text": out.to_string() } ],
+                            "isError": is_err
+                        })),
+                        None,
+                    )
                 }
-                "ping" => serde_json::json!({}),
-                "shutdown" => { running = false; serde_json::json!({}) }
-                "exit" => { running = false; serde_json::json!({}) }
-                other => serde_json::json!({ "error": { "code": -32601, "message": format!("method not found: {other}") } }),
+                "ping" => (Some(serde_json::json!({})), None),
+                "shutdown" => { running = false; (Some(serde_json::json!({})), None) }
+                "exit" => { running = false; (Some(serde_json::json!({})), None) }
+                other => (
+                    None,
+                    Some(serde_json::json!({ "code": -32601, "message": format!("method not found: {other}") })),
+                ),
             };
-            let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id.unwrap(), "result": result });
-            let _ = stdout.write_all(&encode_frame(&resp.to_string()));
-            let _ = stdout.flush();
+            let resp = match err {
+                Some(e) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": e }),
+                None => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            };
+            if let Ok(bytes) = serde_json::to_vec(&resp) {
+                let _ = stdout.write_all(&encode_frame_bytes(&bytes));
+                let _ = stdout.flush();
+            }
         } else if method == "notifications/initialized" {
             initialized = true;
         }
+        // notifications/cancelled and everything else without an id: ignored
         let _ = initialized;
     }
 }
@@ -417,6 +510,6 @@ mod tests {
             let out = dispatch(&cfg, name, &serde_json::json!({}));
             assert!(out["lane"].is_string() || out["lanes"].is_object(), "{name} must answer");
         }
-        assert_eq!(n, 16, "the umbrella covers sixteen tools");
+        assert_eq!(n, 18, "the umbrella covers eighteen tools");
     }
 }

@@ -11,7 +11,7 @@
 use std::io::{Read, Write};
 use std::sync::OnceLock;
 use futures::StreamExt;
-use vaked_lsp::frame::{encode_frame, read_frame};
+use vaked_lsp::frame::{encode_frame_bytes, FrameReader};
 
 // one multi-threaded runtime for the whole process — NATS connections
 // keep their background tasks alive on it (a per-call runtime dies with it).
@@ -78,15 +78,10 @@ fn tool_nats_publish(cfg: &Config, subject: &str, payload: &str) -> serde_json::
         Err(e) => return lane("nats.publish", false, e),
     };
     let bytes = payload.as_bytes().to_vec();
-    // publish on the blocking runtime
-    let fut = c.publish(subject.to_string(), bytes.into());
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map(|rt| rt.block_on(fut))
-    {
-        Ok(Ok(_)) => lane("nats.publish", true, format!("published {subject} · {}B", payload.len())),
-        Ok(Err(e)) => lane("nats.publish", false, format!("{e}")),
+    // publish on the shared multi-thread runtime — a per-call runtime was
+    // ~ms of startup on the mesh's hottest path
+    match rt().block_on(c.publish(subject.to_string(), bytes.into())) {
+        Ok(_) => lane("nats.publish", true, format!("published {subject} · {}B", payload.len())),
         Err(e) => lane("nats.publish", false, format!("{e}")),
     }
 }
@@ -180,13 +175,13 @@ fn dispatch(cfg: &Config, name: &str, args: &serde_json::Value) -> serde_json::V
 // ── the MCP loop ─────────────────────────────────────────────────────────
 fn main() {
     let cfg = Config::from_env();
-    let mut stdin = std::io::stdin().lock();
+    let mut reader = FrameReader::new(std::io::stdin().lock());
     let mut stdout = std::io::stdout().lock();
     let mut initialized = false;
     let mut running = true;
 
     while running {
-        let frame = match read_frame(&mut stdin) {
+        let frame = match reader.read_frame() {
             Ok(f) => f,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -205,33 +200,57 @@ fn main() {
         let params = msg.get("params").cloned().unwrap_or(serde_json::Value::Null);
 
         if id.is_some() {
-            let result = match method {
+            let (result, err): (Option<serde_json::Value>, Option<serde_json::Value>) = match method {
                 "initialize" => {
                     initialized = true;
-                    serde_json::json!({
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": { "tools": {} },
-                        "serverInfo": { "name": "vaked-nats", "version": env!("CARGO_PKG_VERSION") }
-                    })
+                    (
+                        Some(serde_json::json!({
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": { "tools": { "listChanged": false } },
+                            "serverInfo": {
+                                "name": "vaked-nats",
+                                "title": "vaked-nats · the actor-mesh EventBus",
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "description": "the NATS actor-mesh sidecar: publish, request/reply, subscribe — every actor is a subject, every subject is a route"
+                            },
+                            "instructions": "use nats_status to probe the mesh, nats_publish to send to an actor subject, nats_request for reducer-style calls, nats_subscribe to witness N messages"
+                        })),
+                        None,
+                    )
                 }
-                "tools/list" => serde_json::json!({ "tools": tools_list() }),
+                "tools/list" => (Some(serde_json::json!({ "tools": tools_list() })), None),
                 "tools/call" => {
                     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let args = params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
-                    let out = dispatch(&cfg, name, &args).to_string();
-                    serde_json::json!({ "content": [ { "type": "text", "text": out } ] })
+                    let out = dispatch(&cfg, name, &args);
+                    let is_err = out.get("ok").and_then(|v| v.as_bool()) == Some(false);
+                    (
+                        Some(serde_json::json!({
+                            "content": [ { "type": "text", "text": out.to_string() } ],
+                            "isError": is_err
+                        })),
+                        None,
+                    )
                 }
-                "shutdown" | "exit" => { running = false; serde_json::json!({}) }
-                other => {
-                    initialized = false;
-                    serde_json::json!({ "error": { "code": -32601, "message": format!("method not found: {other}") } })
-                }
+                "ping" => (Some(serde_json::json!({})), None),
+                "shutdown" | "exit" => { running = false; (Some(serde_json::json!({})), None) }
+                other => (
+                    None,
+                    Some(serde_json::json!({ "code": -32601, "message": format!("method not found: {other}") })),
+                ),
             };
-            let reply = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
-            let _ = stdout.write_all(&encode_frame(&reply.to_string()));
-            let _ = stdout.flush();
+            let reply = match err {
+                Some(e) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": e }),
+                None => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            };
+            if let Ok(bytes) = serde_json::to_vec(&reply) {
+                let _ = stdout.write_all(&encode_frame_bytes(&bytes));
+                let _ = stdout.flush();
+            }
         } else if method == "notifications/initialized" {
             initialized = true;
         }
+        // notifications/cancelled and everything else without an id: ignored
+        let _ = initialized;
     }
 }
