@@ -1,5 +1,9 @@
 target/
 .venv/
 unity-cloud/.venv/
+mlx-sidecar/.venv/
 __pycache__/
 unity-cloud/__pycache__/
+mlx-sidecar/__pycache__/
+mlx-sidecar/.*.pid
+mlx-sidecar/.*.log

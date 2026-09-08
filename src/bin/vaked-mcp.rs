@@ -26,6 +26,7 @@ struct Config {
     unity_cmd: String,   // path to Unity editor binary
     fab_base: String,    // fab search base url
     unity_cloud_dir: String, // uv project holding the Unity Cloud Python SDK lane
+    mlx_sidecar_dir: String, // uv project holding the MLX coder sidecar
 }
 
 impl Config {
@@ -35,6 +36,7 @@ impl Config {
             unity_cmd: env("VAKED_UNITY", "unity-editor"),
             fab_base: env("VAKED_FAB_BASE", "https://www.fab.com/en-US/search"),
             unity_cloud_dir: env("VAKED_UNITY_CLOUD_DIR", "unity-cloud"),
+            mlx_sidecar_dir: env("VAKED_MLX_SIDECAR_DIR", "mlx-sidecar"),
         }
     }
     fn ue_warm(&self) -> bool { std::path::Path::new(&self.ue_cmd).exists() }
@@ -71,6 +73,7 @@ fn tool_umbrella_status(cfg: &Config) -> serde_json::Value {
             "unreal":  { "cmd": cfg.ue_cmd, "warm": cfg.ue_warm() },
             "unity":   { "cmd": cfg.unity_cmd, "warm": cfg.unity_warm() },
             "unity-cloud": { "uv_project": cfg.unity_cloud_dir, "warm": std::path::Path::new(&cfg.unity_cloud_dir).join("cli.py").exists() },
+            "mlx":        { "uv_project": cfg.mlx_sidecar_dir, "warm": std::path::Path::new(&cfg.mlx_sidecar_dir).join("sidecar.py").exists() },
             "fab":     { "base": cfg.fab_base },
         },
         "doctrine": "one door, many lanes — the lane stays dark when its engine is not running"
@@ -162,6 +165,30 @@ fn tool_unity_peek(asset: &str) -> serde_json::Value {
     }
 }
 
+// mlx_* — the MLX coder sidecar lane: fast top-SWE-score coders, local.
+// Dispatches to the uv project (vaked-lsp/mlx-sidecar).
+fn tool_mlx(cfg: &Config, action: &str, args: &serde_json::Value) -> serde_json::Value {
+    let mut cmd = Command::new("uv");
+    cmd.arg("run").arg("--project").arg(&cfg.mlx_sidecar_dir)
+        .arg("python").arg(format!("{}/sidecar.py", cfg.mlx_sidecar_dir)).arg(action);
+    if let Some(v) = args.get("model").and_then(|v| v.as_str()) {
+        if !v.is_empty() { cmd.arg(v); }
+    }
+    if args.get("quantized").and_then(|v| v.as_bool()).unwrap_or(false) {
+        cmd.arg("--quantized");
+    }
+    match cmd.output() {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let detail = if !out.is_empty() { out } else { err };
+            lane("mlx", o.status.success(),
+                format!("exit {} · {}", o.status.code().unwrap_or(-1), detail))
+        }
+        Err(e) => lane("mlx", false, format!("spawn failed: {e}")),
+    }
+}
+
 // fab_search — the asset marketplace lane: returns the browse/search URL.
 fn tool_fab_search(cfg: &Config, query: &str) -> serde_json::Value {
     let url = format!("{}?keywords={}", cfg.fab_base, query.replace(' ', "%20"));
@@ -210,6 +237,10 @@ fn tools_list() -> Vec<serde_json::Value> {
         serde_json::json!({"name":"unity_batch","description":"run a Unity Editor method in batch mode","inputSchema":{"type":"object","properties":{"method":{"type":"string"}},"required":["method"]}}),
         serde_json::json!({"name":"unity_peek","description":"inspect a Unity scene asset locally (no editor needed)","inputSchema":{"type":"object","properties":{"asset":{"type":"string"}},"required":["asset"]}}),
         serde_json::json!({"name":"unity_cloud","description":"the Unity Cloud Asset Manager lane (Python SDK): projects, assets, search, datasets, upload, download, whoami","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["projects","assets","search","datasets","upload","download","whoami"]},"org":{"type":"string"},"project":{"type":"string"},"asset":{"type":"string"},"version":{"type":"string"},"dataset":{"type":"string"},"file":{"type":"string"},"out":{"type":"string"},"service_account":{"type":"boolean"}},"required":["action"]}}),
+        serde_json::json!({"name":"mlx_status","description":"which local MLX coder lanes are up and healthy","inputSchema":{"type":"object","properties":{}}}),
+        serde_json::json!({"name":"mlx_models","description":"the fast top-SWE-score coder catalog (local MLX)","inputSchema":{"type":"object","properties":{}}}),
+        serde_json::json!({"name":"mlx_start","description":"start a local MLX coder lane","inputSchema":{"type":"object","properties":{"model":{"type":"string"},"quantized":{"type":"boolean"}},"required":["model"]}}),
+        serde_json::json!({"name":"mlx_stop","description":"stop a local MLX coder lane","inputSchema":{"type":"object","properties":{"model":{"type":"string"}},"required":["model"]}}),
         serde_json::json!({"name":"fab_search","description":"build a FAB asset marketplace search URL","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}),
     ]
 }
@@ -240,6 +271,10 @@ fn dispatch(cfg: &Config, name: &str, args: &serde_json::Value) -> serde_json::V
             let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
             tool_unity_cloud(cfg, action, args)
         }
+        "mlx_status" => tool_mlx(cfg, "status", args),
+        "mlx_models" => tool_mlx(cfg, "models", args),
+        "mlx_start" => tool_mlx(cfg, "start", args),
+        "mlx_stop" => tool_mlx(cfg, "stop", args),
         "fab_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             tool_fab_search(cfg, query)
@@ -319,6 +354,7 @@ mod tests {
             unity_cmd: "/nonexistent/Unity".into(),
             fab_base: "https://www.fab.com/en-US/search".into(),
             unity_cloud_dir: "unity-cloud".into(),
+            mlx_sidecar_dir: "mlx-sidecar".into(),
         };
         // cold lanes: never a hard failure — a key, and a door
         let ue = tool_ue_status(&cfg);
@@ -343,6 +379,6 @@ mod tests {
             let out = dispatch(&cfg, name, &serde_json::json!({}));
             assert!(out["lane"].is_string() || out["lanes"].is_object(), "{name} must answer");
         }
-        assert_eq!(n, 8, "the umbrella covers eight tools");
+        assert_eq!(n, 12, "the umbrella covers twelve tools");
     }
 }
