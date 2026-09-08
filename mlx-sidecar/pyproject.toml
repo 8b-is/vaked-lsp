@@ -3,5 +3,7 @@ name = "vaked-mlx-sidecar"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "mflux>=0.19.1",
     "mlx-lm>=0.31.3",
+    "mlx-vlm>=0.4.4",
 ]
