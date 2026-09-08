@@ -1,0 +1,26 @@
+version = 1
+revision = 3
+requires-python = ">=3.13"
+
+[[package]]
+name = "unity-cloud"
+version = "0.10.11"
+source = { registry = "https://unity3ddist.jfrog.io/artifactory/api/pypi/am-pypi-prod-local/simple" }
+wheels = [
+    { url = "https://unity3ddist.jfrog.io/artifactory/api/pypi/am-pypi-prod-local/unity-cloud/0.10.11/unity_cloud-0.10.11-py3-none-linux_x86_64.whl", hash = "sha256:11b0d13a314d22b76da05af06897ced91b48a65a286d6831e411f5f3e9a3a1b8" },
+    { url = "https://unity3ddist.jfrog.io/artifactory/api/pypi/am-pypi-prod-local/unity-cloud/0.10.11/unity_cloud-0.10.11-py3-none-macosx_13_0_arm64.whl", hash = "sha256:ee4a288f672a23d33e8e372e3046601725c936ce207396ea9b4272d223acf529" },
+    { url = "https://unity3ddist.jfrog.io/artifactory/api/pypi/am-pypi-prod-local/unity-cloud/0.10.11/unity_cloud-0.10.11-py3-none-macosx_13_0_universal2.whl", hash = "sha256:77f0ed277a378236ee94f537921b4403addc252e9439159911e247e1507ea683" },
+    { url = "https://unity3ddist.jfrog.io/artifactory/api/pypi/am-pypi-prod-local/unity-cloud/0.10.11/unity_cloud-0.10.11-py3-none-macosx_13_0_x86_64.whl", hash = "sha256:4829d13a9bfba29e8c7833e8cd8710a236d93b733b87f125f85ecb9664b31ed4" },
+    { url = "https://unity3ddist.jfrog.io/artifactory/api/pypi/am-pypi-prod-local/unity-cloud/0.10.11/unity_cloud-0.10.11-py3-none-win_amd64.whl", hash = "sha256:169bfa21129d66b658db0bf92680b8d9b90a3e5ed74d2c2d1df5c89a34e5c3a1" },
+]
+
+[[package]]
+name = "vaked-unity-cloud"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "unity-cloud" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "unity-cloud", specifier = "==0.10.11" }]

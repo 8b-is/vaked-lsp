@@ -1,0 +1,5 @@
+target/
+.venv/
+unity-cloud/.venv/
+__pycache__/
+unity-cloud/__pycache__/

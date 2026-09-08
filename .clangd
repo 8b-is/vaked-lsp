@@ -1,0 +1,14 @@
+# vaked-lsp's UE5 lane — suppress Unreal's MSVC/GCC macro noise
+CompileFlags:
+  Add: [
+    "-D_CRT_SECURE_NO_WARNINGS",
+    "-Wno-ambiguous-reversed-operator",
+    "-Wno-unused-parameter",
+    "-Wno-microsoft-enum-forward-reference"
+  ]
+  Remove: ["-fno-rtti", "-fno-exceptions"]
+
+Diagnostics:
+  UnusedIncludes: Strict
+  ClangTidy:
+    Remove: ["*"]
