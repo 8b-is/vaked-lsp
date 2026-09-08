@@ -1,0 +1,10 @@
+# Rust DX: fast local loop (docs/rust-dx.md).
+# macOS: the Xcode default linker is fast; split-debuginfo cuts dev-link time.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "split-debuginfo=unpacked"]
+
+[target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]   # mold/lld when installed
+
+[build]
+rustc-wrapper = "sccache"   # shared compile cache (cargo deps build once, every branch warm)
