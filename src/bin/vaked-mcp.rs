@@ -27,6 +27,7 @@ struct Config {
     fab_base: String,    // fab search base url
     unity_cloud_dir: String, // uv project holding the Unity Cloud Python SDK lane
     mlx_sidecar_dir: String, // uv project holding the MLX coder sidecar
+    sandbox_script: String,  // path to sandbox.sh
 }
 
 impl Config {
@@ -37,6 +38,7 @@ impl Config {
             fab_base: env("VAKED_FAB_BASE", "https://www.fab.com/en-US/search"),
             unity_cloud_dir: env("VAKED_UNITY_CLOUD_DIR", "unity-cloud"),
             mlx_sidecar_dir: env("VAKED_MLX_SIDECAR_DIR", "mlx-sidecar"),
+            sandbox_script: env("VAKED_SANDBOX_SH", "sandbox.sh"),
         }
     }
     fn ue_warm(&self) -> bool { std::path::Path::new(&self.ue_cmd).exists() }
@@ -74,6 +76,7 @@ fn tool_umbrella_status(cfg: &Config) -> serde_json::Value {
             "unity":   { "cmd": cfg.unity_cmd, "warm": cfg.unity_warm() },
             "unity-cloud": { "uv_project": cfg.unity_cloud_dir, "warm": std::path::Path::new(&cfg.unity_cloud_dir).join("cli.py").exists() },
             "mlx":        { "uv_project": cfg.mlx_sidecar_dir, "warm": std::path::Path::new(&cfg.mlx_sidecar_dir).join("sidecar.py").exists() },
+            "sandbox":    { "script": cfg.sandbox_script, "warm": std::path::Path::new(&cfg.sandbox_script).exists() },
             "fab":     { "base": cfg.fab_base },
         },
         "doctrine": "one door, many lanes — the lane stays dark when its engine is not running"
@@ -165,6 +168,32 @@ fn tool_unity_peek(asset: &str) -> serde_json::Value {
     }
 }
 
+// sandbox_* — the cross-platform dev-tool sandbox lane.
+// macOS: Apple Containers; Linux: bubblewrap + podman.
+fn tool_sandbox(cfg: &Config, action: &str, args: &serde_json::Value) -> serde_json::Value {
+    let mut cmd = Command::new("bash");
+    cmd.arg(&cfg.sandbox_script).arg(action);
+    if let Some(v) = args.get("image").and_then(|v| v.as_str()) {
+        if !v.is_empty() { cmd.arg(v); }
+    }
+    if let Some(v) = args.get("server").and_then(|v| v.as_str()) {
+        if !v.is_empty() { cmd.arg(v); }
+    }
+    if let Some(v) = args.get("name").and_then(|v| v.as_str()) {
+        if !v.is_empty() { cmd.arg(v); }
+    }
+    match cmd.output() {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let detail = if !out.is_empty() { out } else { err };
+            lane("sandbox", o.status.success(),
+                format!("exit {} · {}", o.status.code().unwrap_or(-1), detail))
+        }
+        Err(e) => lane("sandbox", false, format!("spawn failed: {e}")),
+    }
+}
+
 // mlx_* — the MLX coder sidecar lane: fast top-SWE-score coders, local.
 // Dispatches to the uv project (vaked-lsp/mlx-sidecar).
 fn tool_mlx(cfg: &Config, action: &str, args: &serde_json::Value) -> serde_json::Value {
@@ -241,6 +270,10 @@ fn tools_list() -> Vec<serde_json::Value> {
         serde_json::json!({"name":"mlx_models","description":"the fast top-SWE-score coder catalog (local MLX)","inputSchema":{"type":"object","properties":{}}}),
         serde_json::json!({"name":"mlx_start","description":"start a local MLX coder lane (omit model to auto-select by free memory)","inputSchema":{"type":"object","properties":{"model":{"type":"string"},"quantized":{"type":"boolean"},"force":{"type":"boolean"}}}}),
         serde_json::json!({"name":"mlx_stop","description":"stop a local MLX coder lane","inputSchema":{"type":"object","properties":{"model":{"type":"string"}},"required":["model"]}}),
+        serde_json::json!({"name":"sandbox_status","description":"probe the sandbox backends (Apple Containers / bwrap / podman)","inputSchema":{"type":"object","properties":{}}}),
+        serde_json::json!({"name":"sandbox_doctor","description":"check all sandbox backends are available","inputSchema":{"type":"object","properties":{}}}),
+        serde_json::json!({"name":"sandbox_run","description":"run a command in a sandboxed container","inputSchema":{"type":"object","properties":{"image":{"type":"string"}},"required":["image"]}}),
+        serde_json::json!({"name":"sandbox_lsp","description":"wrap an LSP server in a sandbox","inputSchema":{"type":"object","properties":{"server":{"type":"string"}},"required":["server"]}}),
         serde_json::json!({"name":"fab_search","description":"build a FAB asset marketplace search URL","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}),
     ]
 }
@@ -275,6 +308,10 @@ fn dispatch(cfg: &Config, name: &str, args: &serde_json::Value) -> serde_json::V
         "mlx_models" => tool_mlx(cfg, "models", args),
         "mlx_start" => tool_mlx(cfg, "start", args),
         "mlx_stop" => tool_mlx(cfg, "stop", args),
+        "sandbox_status" => tool_sandbox(cfg, "status", args),
+        "sandbox_doctor" => tool_sandbox(cfg, "doctor", args),
+        "sandbox_run" => tool_sandbox(cfg, "run", args),
+        "sandbox_lsp" => tool_sandbox(cfg, "lsp", args),
         "fab_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             tool_fab_search(cfg, query)
@@ -355,6 +392,7 @@ mod tests {
             fab_base: "https://www.fab.com/en-US/search".into(),
             unity_cloud_dir: "unity-cloud".into(),
             mlx_sidecar_dir: "mlx-sidecar".into(),
+            sandbox_script: "sandbox.sh".into(),
         };
         // cold lanes: never a hard failure — a key, and a door
         let ue = tool_ue_status(&cfg);
@@ -379,6 +417,6 @@ mod tests {
             let out = dispatch(&cfg, name, &serde_json::json!({}));
             assert!(out["lane"].is_string() || out["lanes"].is_object(), "{name} must answer");
         }
-        assert_eq!(n, 12, "the umbrella covers twelve tools");
+        assert_eq!(n, 16, "the umbrella covers sixteen tools");
     }
 }
