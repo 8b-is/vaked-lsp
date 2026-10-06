@@ -502,6 +502,30 @@ mod tests {
     }
 
     #[test]
+    fn catalogue_has_unique_tools_and_valid_required_fields() {
+        let tools = tools_list();
+        let mut names = std::collections::HashSet::new();
+        for tool in &tools {
+            let name = tool["name"].as_str().expect("tool name");
+            assert!(!name.is_empty() && names.insert(name), "duplicate or empty tool name");
+            assert!(!tool["description"].as_str().unwrap().is_empty());
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["type"], "object");
+            let properties = schema["properties"].as_object().unwrap();
+            if let Some(required) = schema.get("required") {
+                for field in required.as_array().unwrap() {
+                    assert!(properties.contains_key(field.as_str().unwrap()), "{name}: undefined required field");
+                }
+            }
+        }
+        assert_eq!(tools.len(), 18);
+    }
+
+    // This invokes configured engines, cloud sidecars, model start/stop and
+    // container commands. It is an explicit live integration exercise, not
+    // part of the default unit suite. Review configuration before --ignored.
+    #[test]
+    #[ignore = "live integration: may install dependencies, start/stop models and invoke external tools"]
     fn dispatch_knows_every_tool() {
         let cfg = Config::from_env();
         let n = tools_list().len();

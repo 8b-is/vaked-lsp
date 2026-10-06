@@ -16,29 +16,40 @@ pub fn header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == SEP)
 }
 
-/// Parse `Content-Length` straight from the raw header bytes — no String.
+/// Local resource policy for all framed readers, not protocol-wide limits.
+pub const MAX_HEADER_BYTES: usize = 65536;
+pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Parse one complete decimal length field, rejecting ambiguity and overflow.
+/// Applying the shared limits here also protects the async sub-server reader.
 pub fn content_length(header: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while i + 14 <= header.len() {
-        if &header[i..i + 14] == b"Content-Length" {
-            let mut j = i + 14;
-            while j < header.len() && (header[j] == b':' || header[j] == b' ' || header[j] == b'\t') {
-                j += 1;
-            }
-            let mut n: usize = 0;
-            let mut any = false;
-            while j < header.len() && header[j].is_ascii_digit() {
-                n = n.saturating_mul(10).saturating_add((header[j] - b'0') as usize);
-                any = true;
-                j += 1;
-            }
-            if any {
-                return Some(n);
-            }
-        }
-        i += 1;
+    if header.len() > MAX_HEADER_BYTES {
+        return None;
     }
-    None
+    let mut length = None;
+    for line in header.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
+        if !line[..colon].eq_ignore_ascii_case(b"Content-Length") {
+            continue;
+        }
+        if length.is_some() {
+            return None;
+        }
+        let value = line[colon + 1..].trim_ascii();
+        if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let mut n = 0usize;
+        for digit in value {
+            n = n.checked_mul(10)?.checked_add((digit - b'0') as usize)?;
+        }
+        if n > MAX_BODY_BYTES {
+            return None;
+        }
+        length = Some(n);
+    }
+    length
 }
 
 /// Encode a JSON-RPC payload into LSP stdio framing (one allocation).
@@ -113,7 +124,7 @@ impl<R: Read> FrameReader<R> {
                 self.buf.drain(..body_start + len);
                 return Ok(body);
             }
-            if self.buf.len() > 65536 {
+            if self.buf.len() > MAX_HEADER_BYTES {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "header too long",
@@ -201,4 +212,30 @@ mod tests {
         assert_eq!(content_length(b"Content-Length: 42\r\nX: 1\r\n"), Some(42));
         assert_eq!(content_length(b"x\r\n\r\n"), None);
     }
+    #[test]
+    fn rejects_invalid_lengths() {
+        for header in [
+            "Content-Length: 18446744073709551615999",
+            "Content-Length: 2garbage",
+            "X-Content-Length: 2",
+            "Content-Length: 2\r\nContent-Length: 3",
+            "Content-Length: -2",
+            "Content-Length: 16777217",
+        ] {
+            assert_eq!(content_length(header.as_bytes()), None, "{header}");
+        }
+        assert_eq!(content_length(b"content-length: 2"), Some(2));
+    }
+
+    #[test]
+    fn excessive_frames_fail_before_body_read() {
+        for header in ["Content-Length: 18446744073709551615999".to_owned(),
+                       "Content-Length: 16777217".to_owned(),
+                       format!("X: {}\r\nContent-Length: 0", "a".repeat(65536))] {
+            let bytes = format!("{header}\r\n\r\n").into_bytes();
+            let err = FrameReader::new(std::io::Cursor::new(bytes)).read_frame().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
 }
