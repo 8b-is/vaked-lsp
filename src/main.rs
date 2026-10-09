@@ -7,7 +7,7 @@
 // completion/hover/definition seam. The constellation's architecture
 // at the language level: one door, many lanes.
 
-use vaked_lsp::frame::{content_length, encode_frame_bytes, header_end, jsonrpc_notify, jsonrpc_request};
+use vaked_lsp::frame::{content_length, encode_frame_bytes, header_end, jsonrpc_notify, jsonrpc_request, MAX_HEADER_BYTES};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -80,15 +80,24 @@ impl RouterState {
         let child = entry.child.as_mut()?;
         entry.next_id += 1;
         let id = entry.next_id;
-        let req = jsonrpc_request(id, method, params);
+        let notification = matches!(method, "textDocument/didOpen" | "textDocument/didChange");
+        let req = if notification {
+            jsonrpc_notify(method, params)
+        } else {
+            jsonrpc_request(id, method, params)
+        };
         let req_bytes = serde_json::to_vec(&req).unwrap_or_default();
         // initialize handshake on first forward — the sub-server needs it
         if id == 1 {
             handshake(child, &mut entry.read_buf).await;
         }
         if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(&encode_frame_bytes(&req_bytes)).await;
-            let _ = stdin.flush().await;
+            stdin.write_all(&encode_frame_bytes(&req_bytes)).await.ok()?;
+            stdin.flush().await.ok()?;
+        }
+        // LSP document notifications carry no id and receive no response.
+        if notification {
+            return None;
         }
         // read frames until the response carrying our id — notifications
         // ($/progress) and any other ids are skipped, the pipe never desyncs
@@ -156,7 +165,7 @@ async fn read_sub_frame(
             buf.drain(..body_start + len);
             return v;
         }
-        if buf.len() > 65536 {
+        if buf.len() > MAX_HEADER_BYTES {
             return None;
         }
         let n = stdout.read_buf(buf).await.ok()?;
@@ -270,4 +279,63 @@ mod tests {
         assert_eq!(route_for("file:///scaffold.sh").unwrap().1, "bash");
         assert!(route_for("file:///sandwich.png").is_none());
     }
+    #[tokio::test]
+    async fn document_notifications_do_not_wait_for_responses() {
+        use super::*;
+        use std::time::Duration;
+        let script = r#"
+import sys,json
+def read():
+    headers={}
+    while True:
+        line=sys.stdin.buffer.readline()
+        if not line: raise EOFError()
+        if line==b'\r\n': break
+        k,v=line.decode().split(':',1);headers[k]=v.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers['Content-Length'])))
+for method in ['textDocument/didOpen','textDocument/didChange']:
+    msg=read()
+    assert msg['method']==method and 'id' not in msg, msg
+msg=read()
+assert msg['method']=='textDocument/hover' and 'id' in msg
+body=json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':{'contents':'synthetic hover'}}).encode()
+sys.stdout.buffer.write(b'Content-Length: '+str(len(body)).encode()+b'\r\n\r\n'+body)
+sys.stdout.buffer.flush()
+"#;
+        let child = Command::new("python3").args(["-u", "-c", script])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .kill_on_drop(true).spawn().unwrap();
+        let mut subs = HashMap::new();
+        // Already-initialized synthetic lane isolates notification forwarding.
+        subs.insert("rust", SubServer { child: Some(child), next_id: 1, read_buf: Vec::new() });
+        let (service, _socket) = LspService::new(|client| RouterState {
+            client, sub: Arc::new(Mutex::new(subs)),
+        });
+        let state = service.inner();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            for method in ["textDocument/didOpen", "textDocument/didChange"] {
+                state.forward("file:///synthetic.rs", method, &serde_json::json!({})).await;
+            }
+            state.forward("file:///synthetic.rs", "textDocument/hover", &serde_json::json!({})).await
+        }).await;
+        let mut subs = state.sub.lock().await;
+        if let Some(child) = subs.get_mut("rust").unwrap().child.as_mut() {
+            let _ = child.kill().await;
+        }
+        let response = result.expect("notification forwarding blocked").expect("missing hover reply");
+        assert_eq!(response["result"]["contents"], "synthetic hover");
+    }
+
+    #[tokio::test]
+    async fn async_reader_rejects_oversized_frame_without_waiting() {
+        use super::*;
+        let mut child = Command::new("python3").args(["-u", "-c",
+            "import sys,time;sys.stdout.write('Content-Length: 16777217\\r\\n\\r\\n');sys.stdout.flush();time.sleep(5)"])
+            .stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1),
+            read_sub_frame(child.stdout.as_mut().unwrap(), &mut Vec::new())).await;
+        let _ = child.kill().await;
+        assert!(result.expect("reader waited for oversized body").is_none());
+    }
+
 }

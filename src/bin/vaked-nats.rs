@@ -86,6 +86,16 @@ fn tool_nats_publish(cfg: &Config, subject: &str, payload: &str) -> serde_json::
     }
 }
 
+async fn request_with_deadline<T, E: std::fmt::Display>(
+    timeout_ms: u64,
+    request: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), request).await {
+        Ok(result) => result.map_err(|e| format!("request failed: {e}")),
+        Err(_) => Err(format!("request timed out after {timeout_ms} ms")),
+    }
+}
+
 fn tool_nats_request(cfg: &Config, subject: &str, payload: &str, timeout_ms: u64) -> serde_json::Value {
     if subject.is_empty() {
         return lane("nats.request", false, "subject required".into());
@@ -96,14 +106,13 @@ fn tool_nats_request(cfg: &Config, subject: &str, payload: &str, timeout_ms: u64
     };
 
     let fut = async {
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-        match c.request(subject.to_string(), payload.as_bytes().to_vec().into()).await {
-            Ok(msg) => {
-                let body = String::from_utf8_lossy(&msg.payload).to_string();
-                Ok(body)
-            }
-            Err(e) => Err(format!("request failed: {e}")),
-        }
+        // The outer deadline includes enqueueing. Disable the client's default
+        // response timeout so it cannot silently shorten the caller's budget.
+        let request = async_nats::Request::new()
+            .payload(payload.as_bytes().to_vec().into())
+            .timeout(None);
+        let msg = request_with_deadline(timeout_ms, c.send_request(subject.to_string(), request)).await?;
+        Ok(String::from_utf8_lossy(&msg.payload).to_string())
     };
     match rt().block_on(fut) {
         Ok(reply) => lane("nats.request", true, format!("{subject} → {reply}")),
@@ -252,5 +261,26 @@ fn main() {
         }
         // notifications/cancelled and everything else without an id: ignored
         let _ = initialized;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_with_deadline;
+
+    #[tokio::test]
+    async fn pending_request_obeys_deadline() {
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1),
+            request_with_deadline(20, std::future::pending::<Result<(), &str>>())).await;
+        assert_eq!(result.expect("caller deadline not applied"), Err("request timed out after 20 ms".into()));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn fast_reply_and_error_are_preserved() {
+        assert_eq!(request_with_deadline(100, async { Ok::<_, &str>("reply") }).await, Ok("reply"));
+        assert_eq!(request_with_deadline(100, async { Err::<(), _>("synthetic failure") }).await,
+            Err("request failed: synthetic failure".into()));
     }
 }
